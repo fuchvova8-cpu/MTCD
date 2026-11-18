@@ -1,0 +1,129 @@
+name: Build APK
+
+# Запускается при каждом коммите/загрузке файлов в репозиторий и вручную
+# (вкладка Actions -> Build APK -> Run workflow).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Найти проект. Поддерживаются 3 варианта загрузки с телефона:
+      #    a) в репозиторий загружен ZIP (любой *.zip с проектом внутри) - он будет распакован;
+      #    b) файлы проекта уже лежат в корне репозитория;
+      #    c) файлы проекта лежат в подпапке (например MtcdTools-master/).
+      # ---------------------------------------------------------------
+      - name: Locate project (unzip if needed)
+        id: project
+        shell: bash
+        run: |
+          set -eu
+          WORK="$GITHUB_WORKSPACE/_unzipped"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          # a) ZIP-архив с проектом
+          while IFS= read -r -d '' z; do
+            if unzip -l "$z" | grep -q 'settings\.gradle$'; then
+              echo "Found project archive: $z"
+              unzip -q -o "$z" -d "$WORK"
+              break
+            fi
+          done < <(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' -not -path './_unzipped/*' -print0)
+
+          # b), c) ищем settings.gradle: сначала в распакованном ZIP, потом в самом репозитории
+          SETTINGS=$(find "$WORK" -maxdepth 4 -name settings.gradle 2>/dev/null | head -n1 || true)
+          if [ -z "$SETTINGS" ]; then
+            SETTINGS=$(find . -maxdepth 4 -name settings.gradle -not -path './.git/*' -not -path './_unzipped/*' | head -n1 || true)
+          fi
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle не найден. Загрузите в репозиторий ZIP с проектом или файлы проекта."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(cd "$(dirname "$SETTINGS")" && pwd)
+          echo "Project dir: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+          # Постоянный debug-ключ (если лежит в проекте или в корне репозитория), чтобы каждая сборка
+          # подписывалась одним и тем же ключом и APK ставился поверх предыдущей версии без удаления.
+          KS=""
+          [ -f "$PROJECT_DIR/debug.keystore" ] && KS="$PROJECT_DIR/debug.keystore"
+          [ -z "$KS" ] && [ -f "$GITHUB_WORKSPACE/debug.keystore" ] && KS="$GITHUB_WORKSPACE/debug.keystore"
+          if [ -n "$KS" ]; then
+            mkdir -p "$HOME/.android"
+            cp "$KS" "$HOME/.android/debug.keystore"
+            echo "Using keystore: $KS"
+          fi
+
+      # ---------------------------------------------------------------
+      # 2. Android SDK (platform 25 + build-tools 28.0.3). sdkmanager требует Java 17,
+      #    а Gradle 4.6 / Android Gradle Plugin 3.2.1 - Java 8, поэтому JDK переключается.
+      # ---------------------------------------------------------------
+      - name: Set up JDK 17 (for sdkmanager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set +e
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM=$(command -v sdkmanager)
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1
+          set -e
+          "$SDKM" "platforms;android-25" "build-tools;28.0.3" "platform-tools"
+
+      - name: Set up JDK 8 (for Gradle 4.6)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ---------------------------------------------------------------
+      # 3. Сборка
+      # ---------------------------------------------------------------
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/_out"
+          find "${{ steps.project.outputs.dir }}" -path '*/build/outputs/apk/*' -name '*.apk' -exec cp -v {} "$GITHUB_WORKSPACE/_out/" \;
+          ls -la "$GITHUB_WORKSPACE/_out"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MtcdTools-apk
+          path: _out/*.apk
+          if-no-files-found: error
